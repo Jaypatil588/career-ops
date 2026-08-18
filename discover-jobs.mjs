@@ -18,6 +18,8 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { BROWSER_LIKE_USER_AGENT, fetchJson, fetchText } from './providers/_http.mjs';
+import { decodeEntities } from './providers/_html-entities.mjs';
 
 export const DATASET_BASE = 'https://feashliaa.github.io/job-board-data/data/chunks';
 export const MAX_AGE_HOURS = 48;
@@ -55,26 +57,29 @@ export function jobMatches(job, cutoffMs) {
     && levelMatches(job);
 }
 
+export function compareDiscoveryJobs(a, b) {
+  return Date.parse(b.firstSeen) - Date.parse(a.firstSeen)
+    || a.company.localeCompare(b.company)
+    || a.title.localeCompare(b.title)
+    || a.url.localeCompare(b.url);
+}
+
+export function compareDetailFailures(a, b) {
+  return a.ats.localeCompare(b.ats)
+    || a.company.localeCompare(b.company)
+    || a.title.localeCompare(b.title)
+    || a.url.localeCompare(b.url)
+    || a.error.localeCompare(b.error);
+}
+
 async function fetchBytes(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
   return Buffer.from(await response.arrayBuffer());
 }
 
-function decodeHtml(text) {
-  return String(text || '')
-    .replace(/&nbsp;|&#160;/gi, ' ')
-    .replace(/&amp;|&#38;/gi, '&')
-    .replace(/&lt;|&#60;/gi, '<')
-    .replace(/&gt;|&#62;/gi, '>')
-    .replace(/&quot;|&#34;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_, value) => String.fromCodePoint(Number(value)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, value) => String.fromCodePoint(Number.parseInt(value, 16)));
-}
-
 function htmlToText(html) {
-  return decodeHtml(String(html || '')
+  return decodeEntities(String(html || '')
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' '))
@@ -151,16 +156,6 @@ function assertAtsUrl(job) {
   return url;
 }
 
-async function fetchText(url) {
-  const response = await fetch(url, {
-    redirect: 'error',
-    headers: { 'user-agent': 'Mozilla/5.0 (compatible; CareerOps-Discovery/1.0)' },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.text();
-}
-
 async function fetchJobDetail(job) {
   const url = assertAtsUrl(job);
 
@@ -168,7 +163,7 @@ async function fetchJobDetail(job) {
     const match = url.pathname.match(/^\/([^/]+)\/jobs\/(\d+)/);
     if (!match) throw new Error('Greenhouse URL is missing board and job IDs');
     const apiUrl = `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(match[1])}/jobs/${encodeURIComponent(match[2])}`;
-    const detail = JSON.parse(await fetchText(apiUrl));
+    const detail = await fetchJson(apiUrl, { timeoutMs: REQUEST_TIMEOUT_MS, redirect: 'error' });
     if (typeof detail.content !== 'string' || !detail.content.trim()) throw new Error('Greenhouse detail is missing content');
     return { description: htmlToText(detail.content), datePosted: detail.first_published };
   }
@@ -177,12 +172,16 @@ async function fetchJobDetail(job) {
     const match = url.pathname.match(/^\/careers\/(\d+)/);
     if (!match) throw new Error('BambooHR URL is missing a job ID');
     const apiUrl = `${url.origin}/careers/${encodeURIComponent(match[1])}/detail`;
-    const detail = JSON.parse(await fetchText(apiUrl))?.result?.jobOpening;
+    const detail = (await fetchJson(apiUrl, { timeoutMs: REQUEST_TIMEOUT_MS, redirect: 'error' }))?.result?.jobOpening;
     if (!detail || typeof detail.description !== 'string' || !detail.description.trim()) throw new Error('BambooHR detail is missing a description');
     return { description: htmlToText(detail.description), datePosted: detail.datePosted };
   }
 
-  const html = await fetchText(detailUrl(job));
+  const html = await fetchText(detailUrl(job), {
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    redirect: 'error',
+    headers: { 'user-agent': BROWSER_LIKE_USER_AGENT, 'accept-language': 'en-US,en;q=0.9' },
+  });
   const posting = extractJsonLdJobPosting(html, job.ats);
   if (typeof posting.description !== 'string' || !posting.description.trim()) throw new Error(`${job.ats} detail is missing a description`);
   return { description: htmlToText(posting.description), datePosted: posting.datePosted };
@@ -316,11 +315,14 @@ async function filterByExperience(jobs, cutoffMs) {
 
 export async function run({ now = Date.now(), outputPath = OUTPUT_PATH } = {}) {
   const manifest = await fetchManifest();
-  const cutoffMs = now - MAX_AGE_HOURS * 3_600_000;
+  const referenceMs = Date.parse(manifest.last_updated);
+  if (!Number.isFinite(referenceMs)) throw new Error('job-board-data manifest has an invalid last_updated timestamp');
+  const cutoffMs = referenceMs - MAX_AGE_HOURS * 3_600_000;
   const scan = await scanChunks(manifest.chunks, cutoffMs);
   const experience = await filterByExperience(scan.jobs, cutoffMs);
   const jobs = experience.jobs;
-  jobs.sort((a, b) => Date.parse(b.firstSeen) - Date.parse(a.firstSeen) || a.company.localeCompare(b.company));
+  jobs.sort(compareDiscoveryJobs);
+  experience.failures.sort(compareDetailFailures);
 
   const result = {
     schemaVersion: 1,
@@ -328,6 +330,7 @@ export async function run({ now = Date.now(), outputPath = OUTPUT_PATH } = {}) {
     datasetUpdatedAt: manifest.last_updated,
     filter: {
       observedWithinHours: MAX_AGE_HOURS,
+      referenceTime: manifest.last_updated,
       candidateTimeField: 'first_seen',
       finalTimeField: 'ATS datePosted',
       titleKeywords: ['software', 'AI'],

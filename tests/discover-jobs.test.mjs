@@ -1,5 +1,7 @@
 import {
   classifyExperience,
+  compareDetailFailures,
+  compareDiscoveryJobs,
   extractDescription,
   extractRequiredYears,
   jobMatches,
@@ -74,6 +76,14 @@ check('experience classifier rejects unknown years', classifyExperience(
   { level: 'mid' },
   'Professional software development experience required.',
 ).evidence === 'years-not-stated');
+check('job ordering has deterministic title and URL tie-breakers', [
+  { firstSeen: '2026-08-18T00:00:00Z', company: 'Acme', title: 'Software B', url: 'https://b.example' },
+  { firstSeen: '2026-08-18T00:00:00Z', company: 'Acme', title: 'Software A', url: 'https://a.example' },
+].sort(compareDiscoveryJobs)[0].title === 'Software A');
+check('failure ordering is deterministic', [
+  { ats: 'Workday', company: 'B', title: 'T', url: 'https://b.example', error: 'E' },
+  { ats: 'Ashby', company: 'A', title: 'T', url: 'https://a.example', error: 'E' },
+].sort(compareDetailFailures)[0].ats === 'Ashby');
 
 if (failures > 0) process.exitCode = 1;
-else console.log('discover-jobs: 23 checks passed');
+else console.log('discover-jobs: 25 checks passed');

@@ -192,6 +192,7 @@ const SYSTEM_PATHS = [
   'update-system.mjs',
   'reserve-report-num.mjs',
   'scan.mjs',
+  'discover-jobs.mjs',
   'pipeline-lock.mjs',
   'portal-health-lock.mjs',
   'classify-tier.mjs',
