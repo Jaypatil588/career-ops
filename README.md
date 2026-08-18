@@ -129,6 +129,25 @@ career-ops is the first reference implementation of [the CareerOps Manifesto](ht
 
 ## Quick Start
 
+### 48-hour software/AI discovery and application bridge
+
+This fork includes a narrow, one-shot pipeline for jobs discovered in the last
+48 hours. It passes the validated queue to the existing AutoApply ATS handlers.
+The application browser is always visible and remains open for the run.
+
+```bash
+npm run discover
+npm run apply:setup
+npm run apply:check
+npm run apply:run
+```
+
+`apply:check` must report all 93 queue records with zero exclusions. Before
+`apply:run`, configure AutoApply with your profile and one explicit resume at
+`profile.fallback_resume_path`. CareerOps jobs reuse that file and do not call
+the LLM document generator. CAPTCHA and login gates pause for manual action;
+submission is recorded only after the ATS shows a confirmation.
+
 **Fastest way — one command:**
 
 ```bash

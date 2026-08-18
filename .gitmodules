@@ -1,0 +1,4 @@
+[submodule "vendor/autoapply"]
+	path = vendor/autoapply
+	url = https://github.com/Jaypatil588/AutoApply.git
+	branch = career-ops-bridge

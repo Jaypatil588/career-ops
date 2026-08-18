@@ -23,12 +23,15 @@ import { decodeEntities } from './providers/_html-entities.mjs';
 
 export const DATASET_BASE = 'https://feashliaa.github.io/job-board-data/data/chunks';
 export const MAX_AGE_HOURS = 48;
+export const MAX_DATASET_LAG_HOURS = 24;
 export const OUTPUT_PATH = 'output/discovered-jobs.json';
 
 const CHUNK_CONCURRENCY = 4;
 const DETAIL_CONCURRENCY = 8;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ALLOWED_LEVELS = new Set(['entry', 'mid']);
+const ENTRY_TITLE_RE = /\b(?:junior|jr\.?|entry(?:[\s-]+level)?|associate|new[\s-]+grad(?:uate)?|graduate|early[\s-]+career|engineer\s+i|level\s*1|engr?\s*1)\b/i;
+const INTERN_TITLE_RE = /\b(?:intern(?:ship)?|co[\s-]*op|apprentice)\b/i;
 const SENIOR_TITLE_RE = /\b(?:senior|sr\.?|staff|principal|distinguished|fellow|lead|manager|director|head|chief|vp|vice[\s-]+president|architect|engineer\s+(?:iii|iv|v|vi)|level\s*[4-9]|engr?\s*[4-9])\b/i;
 const JSON_LD_ATS = new Set(['Ashby', 'iCIMS', 'Lever', 'Paylocity', 'Workday']);
 const HTML_ATS = new Set(['BambooHR', 'Greenhouse']);
@@ -41,20 +44,32 @@ export function titleMatches(title) {
 }
 
 export function levelMatches(job) {
-  if (!job || !ALLOWED_LEVELS.has(String(job.skill_level || '').toLowerCase())) return false;
-  return !SENIOR_TITLE_RE.test(String(job.title || ''));
+  if (!job) return false;
+  const title = String(job.title || '');
+  if (INTERN_TITLE_RE.test(title) || SENIOR_TITLE_RE.test(title)) return false;
+  return ALLOWED_LEVELS.has(String(job.skill_level || '').toLowerCase()) || ENTRY_TITLE_RE.test(title);
 }
 
-export function observedWithinWindow(firstSeen, cutoffMs) {
+export function observedWithinWindow(firstSeen, cutoffMs, referenceMs) {
   if (typeof firstSeen !== 'string' || !firstSeen.trim()) return false;
   const observedAt = Date.parse(firstSeen);
-  return Number.isFinite(observedAt) && observedAt >= cutoffMs;
+  return Number.isFinite(observedAt) && observedAt >= cutoffMs && observedAt <= referenceMs;
 }
 
-export function jobMatches(job, cutoffMs) {
-  return observedWithinWindow(job?.first_seen, cutoffMs)
+export function jobMatches(job, cutoffMs, referenceMs) {
+  return observedWithinWindow(job?.first_seen, cutoffMs, referenceMs)
     && titleMatches(job?.title)
     && levelMatches(job);
+}
+
+export function datasetLagHours(datasetUpdatedAtMs, referenceMs) {
+  const lagMs = referenceMs - datasetUpdatedAtMs;
+  if (!Number.isFinite(lagMs) || lagMs < 0) throw new Error('job-board-data manifest timestamp is in the future');
+  const lagHours = lagMs / 3_600_000;
+  if (lagHours > MAX_DATASET_LAG_HOURS) {
+    throw new Error(`job-board-data is stale by ${lagHours.toFixed(1)} hours`);
+  }
+  return lagHours;
 }
 
 export function compareDiscoveryJobs(a, b) {
@@ -190,7 +205,7 @@ async function fetchJobDetail(job) {
 export function extractRequiredYears(description) {
   if (typeof description !== 'string' || !description.trim()) return [];
   const values = [];
-  const yearsRe = /\b(\d{1,2})(?:\s*(?:-|–|—|to)\s*\d{1,2})?\s*\+?\s*(?:years?|yrs?)(?:\s*[’']\s*)?/gi;
+  const yearsRe = /\b(\d{1,2})(?:\s*(?:-|–|—|to)\s*(\d{1,2}))?\s*\+?\s*(?:years?|yrs?)(?:\s*[’']\s*)?/gi;
   for (const match of description.matchAll(yearsRe)) {
     const preceding = description.slice(0, match.index);
     const boundary = Math.max(preceding.lastIndexOf('.'), preceding.lastIndexOf('!'), preceding.lastIndexOf('?'), preceding.lastIndexOf('\n'));
@@ -202,13 +217,17 @@ export function extractRequiredYears(description) {
       : match.index + match[0].length + nextBoundary;
     const context = description.slice(start, end);
     if (!EXPERIENCE_CONTEXT_RE.test(context) || NON_EXPERIENCE_CONTEXT_RE.test(context)) continue;
-    values.push(Number(match[1]));
+    const lower = Number(match[1]);
+    const upper = match[2] === undefined ? lower : Number(match[2]);
+    values.push(Math.max(lower, upper));
   }
   return values;
 }
 
 export function classifyExperience(job, description = '') {
-  if (job.level === 'entry') return { accepted: true, evidence: 'entry-title', requiredYears: null };
+  if (job.level === 'entry' || ENTRY_TITLE_RE.test(String(job.title || ''))) {
+    return { accepted: true, evidence: 'entry-title', requiredYears: null };
+  }
   const years = extractRequiredYears(description);
   if (years.length === 0) return { accepted: false, evidence: 'years-not-stated', requiredYears: null };
   const highestRequirement = Math.max(...years);
@@ -241,7 +260,7 @@ function normalizeJob(job) {
   };
 }
 
-async function scanChunks(chunkNames, cutoffMs) {
+async function scanChunks(chunkNames, cutoffMs, referenceMs) {
   const matches = new Map();
   const stats = { jobsScanned: 0, observedWithin48Hours: 0, keywordMatched: 0, levelMatched: 0 };
   let cursor = 0;
@@ -255,7 +274,7 @@ async function scanChunks(chunkNames, cutoffMs) {
 
       for (const job of jobs) {
         stats.jobsScanned++;
-        if (!observedWithinWindow(job?.first_seen, cutoffMs)) continue;
+        if (!observedWithinWindow(job?.first_seen, cutoffMs, referenceMs)) continue;
         stats.observedWithin48Hours++;
         if (!titleMatches(job?.title)) continue;
         stats.keywordMatched++;
@@ -271,7 +290,7 @@ async function scanChunks(chunkNames, cutoffMs) {
   return { jobs: [...matches.values()], stats };
 }
 
-async function filterByExperience(jobs, cutoffMs) {
+async function filterByExperience(jobs, cutoffMs, referenceMs) {
   const accepted = [];
   const failures = [];
   const stats = { entryTitleAccepted: 0, descriptionAccepted: 0, postedOutside48Hours: 0, requires5Plus: 0, yearsNotStated: 0, detailErrors: 0 };
@@ -284,7 +303,7 @@ async function filterByExperience(jobs, cutoffMs) {
         const detail = await fetchJobDetail(job);
         const postedAt = Date.parse(detail.datePosted);
         if (!Number.isFinite(postedAt)) throw new Error('ATS detail is missing a valid datePosted');
-        if (postedAt < cutoffMs) {
+        if (postedAt < cutoffMs || postedAt > referenceMs) {
           stats.postedOutside48Hours++;
           continue;
         }
@@ -301,6 +320,7 @@ async function filterByExperience(jobs, cutoffMs) {
           postedAt: new Date(postedAt).toISOString(),
           experienceEvidence: classification.evidence,
           requiredYears: classification.requiredYears,
+          description: detail.description,
         });
       } catch (error) {
         stats.detailErrors++;
@@ -313,24 +333,30 @@ async function filterByExperience(jobs, cutoffMs) {
   return { jobs: accepted, stats, failures };
 }
 
-export async function run({ now = Date.now(), outputPath = OUTPUT_PATH } = {}) {
+export async function run({ now, outputPath = OUTPUT_PATH } = {}) {
   const manifest = await fetchManifest();
-  const referenceMs = Date.parse(manifest.last_updated);
-  if (!Number.isFinite(referenceMs)) throw new Error('job-board-data manifest has an invalid last_updated timestamp');
+  const referenceMs = now === undefined ? Date.now() : Number(now);
+  if (!Number.isFinite(referenceMs)) throw new Error('discovery reference time is invalid');
+  const datasetUpdatedAtMs = Date.parse(manifest.last_updated);
+  if (!Number.isFinite(datasetUpdatedAtMs)) throw new Error('job-board-data manifest has an invalid last_updated timestamp');
+  const sourceLagHours = datasetLagHours(datasetUpdatedAtMs, referenceMs);
   const cutoffMs = referenceMs - MAX_AGE_HOURS * 3_600_000;
-  const scan = await scanChunks(manifest.chunks, cutoffMs);
-  const experience = await filterByExperience(scan.jobs, cutoffMs);
+  const scan = await scanChunks(manifest.chunks, cutoffMs, referenceMs);
+  const experience = await filterByExperience(scan.jobs, cutoffMs, referenceMs);
   const jobs = experience.jobs;
   jobs.sort(compareDiscoveryJobs);
   experience.failures.sort(compareDetailFailures);
 
   const result = {
     schemaVersion: 1,
-    generatedAt: new Date(now).toISOString(),
+    generatedAt: new Date(referenceMs).toISOString(),
     datasetUpdatedAt: manifest.last_updated,
+    datasetLagHours: Number(sourceLagHours.toFixed(3)),
     filter: {
       observedWithinHours: MAX_AGE_HOURS,
-      referenceTime: manifest.last_updated,
+      referenceTime: new Date(referenceMs).toISOString(),
+      windowStart: new Date(cutoffMs).toISOString(),
+      windowEnd: new Date(referenceMs).toISOString(),
       candidateTimeField: 'first_seen',
       finalTimeField: 'ATS datePosted',
       titleKeywords: ['software', 'AI'],
