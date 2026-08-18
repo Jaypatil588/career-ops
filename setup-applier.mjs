@@ -11,7 +11,7 @@ const venv = resolve(applierDir, ".venv");
 for (const [command, args] of [
   ["git", ["submodule", "update", "--init", "--depth", "1", "vendor/autoapply"]],
   ["python3", ["-m", "venv", venv]],
-  [resolve(venv, "bin/pip"), ["install", "-q", "-r", resolve(applierDir, "requirements.txt")]],
+  [resolve(venv, "bin/pip"), ["install", "-q", "-e", applierDir]],
 ]) {
   const result = spawnSync(command, args, { cwd: root, stdio: "inherit" });
   if (result.error) {
